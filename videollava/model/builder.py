@@ -22,6 +22,8 @@ import torch
 from videollava.model import *
 from videollava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, \
     DEFAULT_VIDEO_PATCH_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN
+    
+from videollava.constants import DEFAULT_SPEECH_PATCH_TOKEN, DEFAULT_SP_START_TOKEN, DEFAULT_SP_END_TOKEN
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", **kwargs):
@@ -93,11 +95,27 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
+                ### add mm_speech_tower
+
+                #### speech config 더해 줘야대
+                cfg_pretrained.mm_speech_tower='WhisperModel'
+                cfg_pretrained.mm_speech_select_layer=-1
+                cfg_pretrained.mm_sp_hidden_size = 1280
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
-            mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
+            if os.path.exists(os.path.join(model_path, 'mm_projector.bin')):
+                mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
+                
+            else:
+                mm_projector_weights = torch.load(os.path.join('/home/mok/module/Video-LLaVA/checkpoints/videollava-7b-pretrain/mm_projector.bin'), map_location='cpu')
+                
+            # mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
             mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
             model.load_state_dict(mm_projector_weights, strict=False)
+            
+            # mm_sp_projector_weights = torch.load(os.path.join(model_path, 'mm_sp_projector.bin'), map_location='cpu')
+            # mm_sp_projector_weights = {k: v.to(torch.float16) for k, v in mm_sp_projector_weights.items()}
+            # model.load_state_dict(mm_sp_projector_weights, strict=False)
         else:
             if 'mpt' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
@@ -128,7 +146,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
     # ==========================================================================================================
-    processor = {'image': None, 'video': None}
+    processor = {'image': None, 'video': None, 'speech': None}
 
     if 'llava' in model_name.lower():
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
@@ -156,6 +174,15 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             video_tower.to(device=device, dtype=torch.float16)
             video_processor = video_tower.video_processor
             processor['video'] = video_processor
+            
+        if model.config.mm_speech_tower is not None:
+            speech_tower = model.get_speech_tower()
+            if not speech_tower.is_loaded:
+                speech_tower.load_model()
+                
+            speech_tower.to(device=device, dtype=torch.float16)
+            speech_processor = speech_tower.speech_processor
+            processor['speech'] = speech_processor
     # ==========================================================================================================
 
     if hasattr(model.config, "max_sequence_length"):

@@ -1,6 +1,7 @@
 import os
 from .clip_encoder import CLIPVisionTower
 from .languagebind import LanguageBindImageTower, LanguageBindVideoTower
+from .whisper_encoder import WhisperModelTower
 
 # ============================================================================================================
 
@@ -20,3 +21,10 @@ def build_video_tower(video_tower_cfg, **kwargs):
         return LanguageBindVideoTower(video_tower, args=video_tower_cfg, cache_dir='./cache_dir', **kwargs)
     raise ValueError(f'Unknown video tower: {video_tower}')
 # ============================================================================================================
+
+def build_speech_tower(speech_tower_cfg, **kwargs):
+    speech_tower = getattr(speech_tower_cfg, 'mm_speech_tower', getattr(speech_tower_cfg, 'speech_tower', None))
+    
+    if speech_tower.endswith('WhisperModel'):
+        return WhisperModelTower(speech_tower, args=speech_tower_cfg, **kwargs)
+    raise ValueError(f'Unknown speech tower: {speech_tower}')

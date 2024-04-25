@@ -27,18 +27,24 @@ import torch
 
 import transformers
 
+if __name__ == "__main__":
+    import sys
+    sys.path.append(os.path.realpath('~/module/Video-LLaVA-aud2/'))
+
 from videollava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN, DEFAULT_VIDEO_TOKEN, DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN, MAX_IMAGE_LENGTH, \
-    MAX_VIDEO_LENGTH
+    MAX_VIDEO_LENGTH, DEFAULT_SPEECH_TOKEN, SPEECH_TOKEN_INDEX
 from torch.utils.data import Dataset
 from videollava.train.llava_trainer import LLaVATrainer
 
 from videollava import conversation as conversation_lib
 from videollava.model import *
-from videollava.mm_utils import tokenizer_image_token
+from videollava.mm_utils import tokenizer_image_token, tokenizer_image_speech_token, tokenizer_speech_token
 
 from PIL import Image
 from videollava.utils import order_pick_k
+
+import whisper
 
 local_rank = None
 
@@ -54,17 +60,23 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
+    tune_mm_sp_mlp_adapter: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
+    mm_speech_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    pretrain_mm_sp_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
+    mm_use_spch_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    mm_speech_select_feature: Optional[str] = field(default="cls_patch")
 
     # ===================================================================
     image_tower: Optional[str] = field(default=None)
     video_tower: Optional[str] = field(default=None)
+    speech_tower: Optional[str] = field(default=None)
     # ===================================================================
 
 @dataclass
@@ -76,6 +88,7 @@ class DataArguments:
     data_path: Optional[List[str]] = field(default=None, metadata={"help": "Path to the training data."})
     image_folder: Optional[str] = field(default=None)
     video_folder: Optional[str] = field(default=None)
+    speech_folder: Optional[str] = field(default=None)
     num_frames: int = 8
     # ===================================================================
 
@@ -86,6 +99,7 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
+    freeze_mm_sp_mlp_adapter: bool = field(default=False)
     mpt_attn_impl: Optional[str] = field(default="triton")
     model_max_length: int = field(
         default=512,
@@ -198,8 +212,14 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         keys_to_match = ['mm_projector']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
+            
+        keys_to_match2 = ['mm_sp_projector']
+        if getattr(trainer.args, "use_im_start_end", False):
+            keys_to_match2.extend(['embed_tokens', 'embed_in'])
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        
+        weight_to_save2 = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match2)
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split('/')[-1]
@@ -209,8 +229,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                 mm_projector_folder = os.path.join(parent_folder, "mm_projector")
                 os.makedirs(mm_projector_folder, exist_ok=True)
                 torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
+                
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+                torch.save(weight_to_save2, os.path.join(output_dir, f'mm_sp_projector.bin'))
         return
 
     if trainer.deepspeed:
@@ -339,18 +361,25 @@ def preprocess_multimodal(
                 if VIDEO_TOKEN_NUM > MAX_VIDEO_LENGTH:
                     raise ValueError(f"{sentence['value']}")
                     sentence['value'] = sentence['value'].replace(DEFAULT_VIDEO_TOKEN * VIDEO_TOKEN_NUM, DEFAULT_VIDEO_TOKEN * MAX_VIDEO_LENGTH).strip()
-
+                SPEECH_TOKEN_NUM = sentence['value'].count(DEFAULT_SPEECH_TOKEN) ### should be 1.
+                if SPEECH_TOKEN_NUM > MAX_VIDEO_LENGTH:
+                    raise ValueError(f"{sentence['value']}")
+                    sentence['value'] = sentence['value'].replace(DEFAULT_SPEECH_TOKEN * SPEECH_TOKEN_NUM, DEFAULT_SPEECH_TOKEN * MAX_VIDEO_LENGTH).strip()
+                
             # a <video> is treated as `num_frames * <image>`
             replace_token, vid_replace_token = DEFAULT_IMAGE_TOKEN, DEFAULT_IMAGE_TOKEN * data_args.num_frames
+            spch_replace_token = DEFAULT_SPEECH_TOKEN * SPEECH_TOKEN_NUM
             if data_args.mm_use_im_start_end:
                 replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
                 vid_replace_token = DEFAULT_VID_START_TOKEN + vid_replace_token + DEFAULT_VID_END_TOKEN
+                
 
             # <video><video><image><image>\nxxxxxxxxxxxxx -> `num_frames*<image>``num_frames*<image>`<image><image>\nxxxxxxxxxxxxx
             # <video>\nxxxxxxxxxxxxx -> `num_frames*<image>`\nxxxxxxxxxxxxx
             # print('before replace_token:', [sentence['value']])
             sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
             sentence['value'] = sentence['value'].replace(DEFAULT_VIDEO_TOKEN, vid_replace_token)
+            sentence["value"] = sentence['value'].replace(DEFAULT_SPEECH_TOKEN, spch_replace_token)
             # print('after replace_token:', [sentence['value']])
             # ======================================================================================================
 
@@ -360,7 +389,8 @@ def preprocess_multimodal(
 def preprocess_llama_2(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_speech: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -442,7 +472,8 @@ def preprocess_llama_2(
 def preprocess_v1(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_speech: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -462,8 +493,11 @@ def preprocess_v1(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-
-    if has_image:
+    if has_image and has_speech:
+        input_ids = torch.stack([tokenizer_image_speech_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    elif has_speech:
+        input_ids = torch.stack([tokenizer_speech_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    elif has_image:
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
         input_ids = tokenizer(
@@ -495,7 +529,13 @@ def preprocess_v1(
                 break
             parts[0] += sep
 
-            if has_image:
+            if has_image and has_speech:
+                round_len = len(tokenizer_image_speech_token(rou, tokenizer))
+                instruction_len = len(tokenizer_image_speech_token(parts[0], tokenizer)) - 2
+            elif has_speech:
+                round_len = len(tokenizer_speech_token(rou, tokenizer))
+                instruction_len = len(tokenizer_speech_token(parts[0], tokenizer)) - 2
+            elif has_image:
                 round_len = len(tokenizer_image_token(rou, tokenizer))
                 instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
             else:
@@ -612,7 +652,8 @@ def preprocess_plain(
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_speech: bool = False
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -626,7 +667,7 @@ def preprocess(
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_image=has_image)
+        return preprocess_v1(sources, tokenizer, has_image=has_image, has_speech=has_speech)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer)
     # add end signal and concatenate together
@@ -637,10 +678,21 @@ def preprocess(
         conversations.append(conversation)
     # tokenize conversations
     def get_tokenize_len(prompts):
-        return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
+        if has_image and has_speech:
+            return [len(tokenizer_image_speech_token(prompt, tokenizer)) for prompt in prompts]
+        
+        elif has_speech:
+            return [len(tokenizer_speech_token(prompt, tokenizer)) for prompt in prompts]
+        
+        else:
+            raise ValueError("It should always have has_image True")
 
-    if has_image:
+    if has_image and has_speech:
+        input_ids = [tokenizer_image_speech_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+    elif has_image:
         input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+    elif has_speech:
+        input_ids = [tokenizer_speech_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
     else:
         conversations_tokenized = _tokenize_fn(conversations, tokenizer)
         input_ids = conversations_tokenized["input_ids"]
@@ -718,7 +770,7 @@ class LazySupervisedDataset(Dataset):
                 sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
             # ======================================================================================================
-            if 'image' in sources[0] and 'video' not in sources[0]:
+            if 'image' in sources[0] and 'video' not in sources[0]: # 이미지 있고 비디오 없을 때
                 # rank0_print('image')
                 image_file = self.list_data_dict[i]['image']
                 image_folder = self.data_args.image_folder
@@ -735,7 +787,7 @@ class LazySupervisedDataset(Dataset):
                 sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
                 data_dict = preprocess(sources, self.tokenizer, has_image=True)
 
-            elif 'image' not in sources[0] and 'video' in sources[0]:
+            elif 'image' not in sources[0] and 'video' in sources[0]: # 이미지 없고 비디오 잇을 때
                 # rank0_print('video')
                 video_file = self.list_data_dict[i]['video']
                 video_folder = self.data_args.video_folder
@@ -745,12 +797,22 @@ class LazySupervisedDataset(Dataset):
                 video = [os.path.join(video_folder, file) for file in video_file]
                 image = [video_processor(i, return_tensors='pt')['pixel_values'][0] for i in video]  # fake image
                 # image = [torch.randn(3, 8, 224, 224) for i in video]  # fake image
+
+                if 'speech' in sources[0]:
+                    speech_file = self.list_data_dict[i]['speech']
+                    speech_folder = self.data_args.speech_folder
+                    speech_processor = self.data_args.speech_processor
+                    speech_file = speech_file if isinstance(speech_file, list) else [speech_file]
+                    speech = [whisper.load_audio(os.path.join(speech_folder, file)) for file in speech_file]
+                    speech = [speech_processor(i, return_tensors='pt').input_features for i in speech]
+
                 sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
                 # print('after preprocess_multimodal', sources[0])
-                data_dict = preprocess(sources, self.tokenizer, has_image=True)
+                data_dict = preprocess(sources, self.tokenizer, has_image=True, has_speech=True)
                 # print('after preprocess', data_dict['input_ids'])
+                
 
-            elif 'image' in sources[0] and 'video' in sources[0]:
+            elif 'image' in sources[0] and 'video' in sources[0]: # 둘다 있을 때
                 # rank0_print('image & video')
                 # video must before image
                 video_file = self.list_data_dict[i]['video']
@@ -780,8 +842,22 @@ class LazySupervisedDataset(Dataset):
                 sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
                 data_dict = preprocess(sources, self.tokenizer, has_image=True)
             else:
-                sources = copy.deepcopy([e["conversations"] for e in sources])
-                data_dict = preprocess(sources, self.tokenizer, has_image=False)
+                
+                ### no image no video but only speech
+                if 'speech' in sources[0]:
+                    speech_file = self.list_data_dict[i]['speech']
+                    speech_folder = self.data_args.speech_folder
+                    speech_processor = self.data_args.speech_processor
+                    speech_file = speech_file if isinstance(speech_file, list) else [speech_file]
+                    speech = [whisper.load_audio(os.path.join(speech_folder, file)) for file in speech_file]
+                    speech = [speech_processor(i, sampling_rate=16000, return_tensors='pt').input_features for i in speech]
+                    # print('speech', speech[0].shape, len(speech))
+                    sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+                    # print('after preprocess_multimodal', sources[0])
+                    data_dict = preprocess(sources, self.tokenizer, has_image=True, has_speech=True)
+                else:
+                    sources = copy.deepcopy([e["conversations"] for e in sources])
+                    data_dict = preprocess(sources, self.tokenizer, has_image=False)
 
             # ==========================================================================================================
 
@@ -791,6 +867,9 @@ class LazySupervisedDataset(Dataset):
             # image exist in the data
             if 'image' in self.list_data_dict[i] or 'video' in self.list_data_dict[i]:
                 data_dict['image'] = image
+                
+            if 'speech' in self.list_data_dict[i]:
+                data_dict['speech'] = speech
             elif self.data_args.is_multimodal:
                 # image does not exist in the data, but the model is multimodal
                 # crop_size = self.data_args.image_processor.crop_size
@@ -842,6 +921,20 @@ class DataCollatorForSupervisedDataset(object):
                 image(3, 224, 224),      # sample 6
             ]
         '''
+        
+        if 'speech' in instances[0]:
+            speeches = [instance['speech'] for instance in instances]
+            
+            new_speeches = []
+            for speech in speeches:
+                if type(speech) is list:
+                    for i in speech:
+                        new_speeches.append(i)
+                else:
+                    new_speeches.append(speech)
+                    
+            speeches = new_speeches
+            
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
 
@@ -857,6 +950,7 @@ class DataCollatorForSupervisedDataset(object):
 
         # ==========Too many videos or images may lead to OOM, so we encode them one by one======================
             batch['images'] = images
+            batch['speeches'] = speeches
         #     if all(x is not None and x.shape == images[0].shape for x in images):  # if all images or all videos
         #         batch['images'] = torch.stack(images)
         #     else:
@@ -1004,6 +1098,7 @@ def train():
             model_args=model_args,
             fsdp=training_args.fsdp
         )
+        
         if model_args.image_tower is not None:
             image_tower = model.get_image_tower()
             image_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -1017,8 +1112,19 @@ def train():
             data_args.video_processor = video_tower.video_processor
             data_args.is_multimodal = True
             data_args.num_frames = video_tower.config.num_frames
+            
+    if model_args.speech_tower is not None:
+        model.get_model().initialize_speech_modules(
+            model_args=model_args,
+            fsdp=training_args.fsdp
+        )
+        
+        speech_tower = model.get_speech_tower()
+        speech_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        
+        data_args.speech_processor = speech_tower.speech_processor
+        data_args.is_multimodal = True
     # =============================================================================================================
-
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
         model.config.tokenizer_padding_side = tokenizer.padding_side
@@ -1029,14 +1135,23 @@ def train():
         # =============================================================================================================
         
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        model.config.tune_mm_sp_mlp_adapter = training_args.tune_mm_sp_mlp_adapter = model_args.tune_mm_sp_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = True
+                
+            for p in model.get_model().mm_sp_projector.parameters():
                 p.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
+                
+        model.config.freeze_mm_sp_mlp_adapter = training_args.freeze_mm_sp_mlp_adapter   
+        if training_args.freeze_mm_sp_mlp_adapter:
+            for p in model.get_model().mm_sp_projector.parameters():
                 p.requires_grad = False
 
         if training_args.bits in [4, 8]:
@@ -1047,6 +1162,7 @@ def train():
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        model.initialize_speech_tokenizer(model_args, tokenizer=tokenizer)
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
