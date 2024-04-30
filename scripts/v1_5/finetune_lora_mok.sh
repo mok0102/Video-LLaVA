@@ -4,7 +4,7 @@ JSON_FOLDER="/home/mok/module/Video-LLaVA/llava_all_image_video/ft_json"
 IMAGE_FOLDER="/home/mok/module/Video-LLaVA/llava_all_image_video"
 VIDEO_FOLDER="/node_data/hyun/mok/data/MELD.Raw/train_splits"
 SPEECH_FOLDER="/node_data/hyun/mok/data/MELD.Raw/train_splits"
-cd /home/mok/module/Video-LLaVA-aud2
+cd /home/mok/module/Video-LLaVA-Speech
 
 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed videollava/train/train_mem.py \
     --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \

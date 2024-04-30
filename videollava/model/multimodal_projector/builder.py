@@ -53,6 +53,7 @@ def build_vision_projector(config, delay_load=False, **kwargs):
 
 def build_speech_projector(config, delay_load=False, **kwargs):
     projector_type = getattr(config, 'mm_projector_type', 'linear')
+    # config.mm_sp_hidden_size = 1280
 
     if projector_type == 'linear':
         return nn.Linear(config.mm_sp_hidden_size, config.hidden_size)

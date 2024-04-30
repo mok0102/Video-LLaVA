@@ -4,9 +4,9 @@ JSON_FOLDER="/home/mok/module/Video-LLaVA/llava_all_image_video/ft_json"
 IMAGE_FOLDER="/home/mok/module/Video-LLaVA/llava_all_image_video"
 VIDEO_FOLDER="/node_data/hyun/mok/data/MELD.Raw/train_splits"
 SPEECH_FOLDER="/node_data/hyun/mok/data/MELD.Raw/train_splits"
-cd ~/module/Video-LLaVA-aud2
+cd ~/module/Video-LLaVA-Speech
 
-HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed videollava/train/train_mem.py \
+HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed --include localhost:0,1 videollava/train/train_mem.py \
     --deepspeed ./scripts/zero2_offload.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
     --version v1 \
@@ -16,16 +16,19 @@ HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 deepspeed videollava/train/train_me
     --speech_folder ${SPEECH_FOLDER} \
     --speech_tower WhisperModel \
     --mm_projector_type mlp2x_gelu \
+    --tune_mm_mlp_adapter False \
+    --tune_mm_sp_mlp_adapter True \
     --pretrain_mm_mlp_adapter /home/mok/module/Video-LLaVA/checkpoints/videollava-7b-pretrain/mm_projector.bin \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
+    --mm_use_spch_patch_token False \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
     --output_dir ./checkpoints/videollava-7b-aud-debug \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \

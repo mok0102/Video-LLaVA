@@ -97,8 +97,8 @@ class LlavaMetaModel:
         
         if getattr(self, 'mm_projector_speech', None) is None:
             self.mm_sp_projector = build_speech_projector(self.config)
-            # for p in self.mm_sp_projector.parameters():
-            #     p.requires_grad = True
+            for p in self.mm_sp_projector.parameters():
+                p.requires_grad = True
             
         else:
             for p in self.mm_projector_speech.parameters():
@@ -109,7 +109,7 @@ class LlavaMetaModel:
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
-            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            self.mm_sp_projector.load_state_dict(get_w(mm_projector_weights, 'mm_sp_projector'))
 
 
     def initialize_vision_modules(self, model_args, fsdp=None):
@@ -296,12 +296,12 @@ class LlavaMetaForCausalLM(ABC):
                 t = video_features_minibatch[i].shape[0]
                 tmp_image_features[pos] = [video_features_minibatch[i][j] for j in range(t)]
         
-        if speeches is not None:
-            tmp_speech_features = [None] * len(speech_idx)
-            if getattr(speeches_minibatch, 'ndim', 0) == 3: # 1,2,1280 ->
-                speech_features_minibatch = self.encode_speeches(speeches_minibatch) # encode_speech가 (1, 80, 3000) 받아서 (1,2,4096)
-                for i, pos in enumerate(speech_idx):
-                    tmp_speech_features[pos] = speech_features_minibatch[i]
+        # if speeches is not None:
+        tmp_speech_features = [None] * len(speech_idx)
+        if getattr(speeches_minibatch, 'ndim', 0) == 3: # 1,2,1280 ->
+            speech_features_minibatch = self.encode_speeches(speeches_minibatch) # encode_speech가 (1, 80, 3000) 받아서 (1,2,4096)
+            for i, pos in enumerate(speech_idx):
+                tmp_speech_features[pos] = speech_features_minibatch[i]
         
         # import pdb; pdb.set_trace()
     
@@ -355,17 +355,18 @@ class LlavaMetaForCausalLM(ABC):
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-        # remove the padding using attention_mask -- TODO: double check
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
-
+        
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
+        cur_speech_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-            # print(num_images, cur_input_ids)
-            if num_images == 0:
+            num_speeches = (cur_input_ids == SPEECH_TOKEN_INDEX).sum()
+            # print(num_images, num_speeches)
+            if num_images + num_speeches == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
@@ -388,17 +389,18 @@ class LlavaMetaForCausalLM(ABC):
                 cur_new_input_embeds = []
                 cur_new_labels = []
                 
-                # import pdb; pdb.set_trace()
-                for i in range(num_images + 1):
+                
+                for i in range(num_images + num_speeches + 1):
                     cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                     cur_new_labels.append(cur_labels_noim[i])
                     
                     if i==0: ### the first multimodal feature는 항상 speech다!
-                        cur_speech_features = speech_features[0]#.unsqueeze(0) ### only 1 speech feature, shape of (2, 4096)
+                        cur_speech_features = speech_features[cur_speech_idx]#.unsqueeze(0) ### only 1 speech feature, shape of (2, 4096)
+                        cur_speech_idx += 1
                         cur_new_input_embeds.append(cur_speech_features)
                         cur_new_labels.append(torch.full((cur_speech_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                         
-                    elif i-1 < num_images:
+                    elif i < num_images + num_speeches:
                         # print(cur_image_idx)
                         cur_image_features = image_features[cur_image_idx] #257, 4096
                         cur_image_idx += 1
@@ -431,6 +433,13 @@ class LlavaMetaForCausalLM(ABC):
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
+
+            new_input_embeds.append(cur_new_input_embeds)
+            new_labels.append(cur_new_labels)
+            # print('llava arch cur_new_labels', cur_new_labels)
+            # print(torch.all(cur_new_labels == -100))
+            
+            # import pdb; pdb.set_trace()
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
@@ -485,6 +494,8 @@ class LlavaMetaForCausalLM(ABC):
 
         if _position_ids is None:
             position_ids = None
+            
+        # print('llava_arch', new_input_embeds.shape)
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
@@ -536,3 +547,11 @@ class LlavaMetaForCausalLM(ABC):
         if model_args.mm_use_spch_patch_token:
             tokenizer.add_tokens([DEFAULT_SPEECH_PATCH_TOKEN], special_tokens=True)
             self.resize_token_embeddings(len(tokenizer))
+            
+            
+if __name__=='__main__':
+    model = LlavaLlamaForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                **bnb_model_from_pretrained_args
+            )
