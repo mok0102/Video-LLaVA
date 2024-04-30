@@ -11,17 +11,21 @@ import whisper
 
 def main():
     disable_torch_init()
-    video = '/home/mok/module/Video-LLaVA/test.mp4'
+    # video = '/home/mok/module/Video-LLaVA/test.mp4'
+    video = '/node_data/hyun/mok/data/MELD.Raw/train_splits/dia0_utt0.mp4'
     
     ### laugh reasoing 가능, scene에서 relation 추론 가능, emotion 추론 가능
     inp = 'Give me the reason why the person laughed in this clip. \
 I also give you transcription and the relation between two people.\
 Utterance: Why do you love me? Oh, I love you because youre my firstborn. Youre my game changer, my life changer.\
-Suck it, siblings. '
+# Suck it, siblings. '
+    inp = 'Please transcribe the given video.'
+    inp = 'How is the speaker currently feeling?'
+    
     model_base = "lmsys/vicuna-7b-v1.5"
     # model_path = "./checkpoints/videollava-7b-lora"
     # model_path = "/home/mok/module/Video-LLaVA/checkpoints/videollava-7b"
-    model_path = "/home/mok/module/Video-LLaVA-aud/checkpoints/videollava-7b-aud-debug"
+    model_path = "/home/mok/module/Video-LLaVA-Speech/checkpoints/videollava-7b-aud-debug"
     cache_dir = '/home/mok/module/Video-LLaVA/cache_dir'
     device = 'cuda'
     load_4bit, load_8bit = True, False
@@ -39,12 +43,15 @@ Suck it, siblings. '
     else:
         tensor = video_tensor.to(model.device, dtype=torch.float16)
         
+    tensor = torch.rand(tensor.shape).to(model.device, dtype=torch.float16)
+        
     # import pdb; pdb.set_trace()
     
     audio = whisper.load_audio(video)
-    # audio = whisper.pad_or_trim(audio)
+    audio = whisper.pad_or_trim(audio)
     
-    speech_tensor = [speech_processor(audio, return_tensors='pt').input_features]
+    speech_tensor = [speech_processor(audio, sampling_rate=16000, return_tensors='pt').input_features]
+    
     
     if type(speech_tensor) is list:
         speech = [speech.to(model.device, dtype=torch.float16) for speech in speech_tensor]

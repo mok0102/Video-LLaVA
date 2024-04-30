@@ -89,7 +89,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             
         # import pdb; pdb.set_trace()
         
-        # print('input_embeds')
 
         return super().forward(
             input_ids=input_ids,
