@@ -3,7 +3,7 @@
 <p align="center">
     <img src="https://z1.ax1x.com/2023/11/07/pil4sqH.png" width="150" style="margin-bottom: 0.2;"/>
 <p>
-<h2 align="center"> <a href="https://arxiv.org/abs/2311.10122">Video-LLaVA-Speech: Modified version of VideoLLaVA with whisper encoder</a></h2>
+<h2 align="center"> <a href="https://arxiv.org/abs/2311.10122">Video-LLaVA: Modified version of VideoLLaVA</a></h2>
 <h5 align="center"> If you like our project, please give us a star ⭐ on GitHub for latest update.  </h2>
 
 
